@@ -1,25 +1,26 @@
 """
-FsExplorer Agent for filesystem exploration using Google Gemini.
+FsExplorer Agent for filesystem exploration using Qwen3 via Ollama.
 
-This module contains the agent that interacts with the Gemini AI model
-to make decisions about filesystem exploration actions.
+This module contains the agent that interacts with the Qwen3 AI model
+(via Ollama's native API) to make decisions about filesystem exploration actions.
 """
 
+import json
 import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Any, cast
-from dataclasses import dataclass
 
 from dotenv import load_dotenv
-from google.genai.types import Content, HttpOptions, Part
-from google.genai import Client as GenAIClient
+import httpx
 
 # Load .env file from project root
 _env_path = Path(__file__).parent.parent.parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
 
-from .models import Action, ActionType, ToolCallAction, Tools
+from .models import Action, ActionType, StopAction, ToolCallAction, Tools
 from .fs import (
     read_file,
     grep_file_content,
@@ -34,37 +35,32 @@ from .fs import (
 # Token Usage Tracking
 # =============================================================================
 
-# Gemini Flash pricing (per million tokens)
-GEMINI_FLASH_INPUT_COST_PER_MILLION = 0.075
-GEMINI_FLASH_OUTPUT_COST_PER_MILLION = 0.30
-
-
 @dataclass
 class TokenUsage:
     """
-    Track token usage and costs across the session.
-    
-    Maintains running totals of API calls, token counts, and provides
-    cost estimates based on Gemini Flash pricing.
+    Track token usage across the session.
+
+    Maintains running totals of API calls and token counts.
+    Since we're using a local model, no cost estimates are provided.
     """
-    
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
     api_calls: int = 0
-    
+
     # Track content sizes
     tool_result_chars: int = 0
     documents_parsed: int = 0
     documents_scanned: int = 0
-    
+
     def add_api_call(self, prompt_tokens: int, completion_tokens: int) -> None:
         """Record token usage from an API call."""
         self.prompt_tokens += prompt_tokens
         self.completion_tokens += completion_tokens
         self.total_tokens += prompt_tokens + completion_tokens
         self.api_calls += 1
-    
+
     def add_tool_result(self, result: str, tool_name: str) -> None:
         """Record metrics from a tool execution."""
         self.tool_result_chars += len(result)
@@ -75,17 +71,9 @@ class TokenUsage:
             self.documents_scanned += result.count("│ [")
         elif tool_name == "preview_file":
             self.documents_parsed += 1
-    
-    def _calculate_cost(self) -> tuple[float, float, float]:
-        """Calculate estimated costs based on Gemini Flash pricing."""
-        input_cost = (self.prompt_tokens / 1_000_000) * GEMINI_FLASH_INPUT_COST_PER_MILLION
-        output_cost = (self.completion_tokens / 1_000_000) * GEMINI_FLASH_OUTPUT_COST_PER_MILLION
-        return input_cost, output_cost, input_cost + output_cost
-    
+
     def summary(self) -> str:
-        """Generate a formatted summary of token usage and costs."""
-        input_cost, output_cost, total_cost = self._calculate_cost()
-        
+        """Generate a formatted summary of token usage."""
         return f"""
 ═══════════════════════════════════════════════════════════════
                       TOKEN USAGE SUMMARY
@@ -99,10 +87,8 @@ class TokenUsage:
   Documents Parsed:    {self.documents_parsed}
   Tool Result Chars:   {self.tool_result_chars:,}
 ───────────────────────────────────────────────────────────────
-  Est. Cost (Gemini Flash):
-    Input:  ${input_cost:.4f}
-    Output: ${output_cost:.4f}
-    Total:  ${total_cost:.4f}
+  Model: Qwen3 32B (Local via Ollama)
+  Cost:  $0.00 (Local inference)
 ═══════════════════════════════════════════════════════════════
 """
 
@@ -126,110 +112,44 @@ TOOLS: dict[Tools, Callable[..., str]] = {
 # =============================================================================
 
 SYSTEM_PROMPT = """
-You are FsExplorer, an AI agent that explores filesystems to answer user questions about documents.
+You are FsExplorer, an AI agent that answers user questions by reading documents in a folder.
 
-## Available Tools
+## Tools
 
-| Tool | Purpose | Parameters |
-|------|---------|------------|
-| `scan_folder` | **PARALLEL SCAN** - Scan ALL documents in a folder at once | `directory` |
-| `preview_file` | Quick preview of a single document (~first page) | `file_path` |
-| `parse_file` | **DEEP READ** - Full content of a document | `file_path` |
-| `read` | Read a plain text file | `file_path` |
-| `grep` | Search for a pattern in a file | `file_path`, `pattern` |
-| `glob` | Find files matching a pattern | `directory`, `pattern` |
+- `scan_folder(directory)` — Scan all documents in a folder (gives previews of each)
+- `parse_file(file_path)` — Read complete content of a document
+- `preview_file(file_path)` — Quick preview of a document
+- `read(file_path)` — Read a plain text file
+- `grep(file_path, pattern)` — Search for a pattern in a file
+- `glob(directory, pattern)` — Find files matching a glob pattern
 
-## Three-Phase Document Exploration Strategy
+## IMPORTANT RULES
 
-### PHASE 1: Parallel Scan (Use `scan_folder`)
-When you encounter a folder with documents:
-1. Use `scan_folder` to scan ALL documents in parallel
-2. This gives you a quick preview of every document at once
-3. In your **reason**, explicitly list your document categorization:
-   - **RELEVANT**: Documents clearly related to the query (list them)
-   - **MAYBE**: Documents that might be relevant (list them)
-   - **SKIP**: Documents not relevant (list them)
+1. **ONLY use file paths returned by tool results.** After calling scan_folder, the result will contain exact file paths. Copy-paste those paths exactly into subsequent tool calls. NEVER make up a file path.
+2. **Never ask the user about files.** If you need a file, just call parse_file or preview_file with the path from scan results.
+3. **Cite your sources** in the final answer using `[Source: <filename>, <section>]` format.
 
-### PHASE 2: Deep Dive (Use `parse_file`)
-1. Use `parse_file` on documents marked RELEVANT
-2. In your **reason**, explain what key information you found
-3. **WATCH FOR CROSS-REFERENCES** - look for mentions like:
-   - "See Exhibit A/B/C..."
-   - "As stated in the [Document Name]..."
-   - "Refer to [filename]..."
-   - Document numbers, exhibit labels, or file names
-4. In your **reason**, note any cross-references you discovered
+## Workflow
 
-### PHASE 3: Backtracking (Revisit if Cross-Referenced)
-**CRITICAL**: If a document you're reading references another document that you SKIPPED:
-1. In your **reason**, explain: "Found cross-reference to [document] - need to backtrack"
-2. Use `preview_file` or `parse_file` to read the referenced document
-3. Continue this until all relevant cross-references are resolved
+1. Start with `scan_folder` on the target directory to see all documents
+2. Read the scan results carefully — note the EXACT file paths listed
+3. Call `parse_file` on documents relevant to the user's question (use the exact paths from step 2)
+4. If a document references another document, parse that one too
+5. When you have enough information, stop and provide your final answer with citations
 
-## Providing Detailed Reasoning
+## Response Format
 
-Your `reason` field is displayed to the user, so make it informative:
-- After scanning: List which documents you're categorizing as RELEVANT/MAYBE/SKIP and why
-- After parsing: Summarize key findings and any cross-references discovered
-- When backtracking: Explain which reference led you back to a skipped document
+Respond with ONLY valid JSON (no other text):
 
-## CRITICAL: Citation Requirements for Final Answers
+{"action": {"tool_name": "...", "tool_input": [{"parameter_name": "...", "parameter_value": "..."}]}, "reason": "..."}
 
-When providing your final answer, you MUST include citations for ALL factual claims:
+OR to give the final answer:
 
-### Citation Format
-Use inline citations in this format: `[Source: filename, Section/Page]`
+{"action": {"final_result": "Your answer with [Source: filename, section] citations..."}, "reason": "..."}
 
-Example:
-> The total purchase price is $125,000,000 [Source: 01_master_agreement.pdf, Section 2.1], 
-> consisting of $80M cash [Source: 01_master_agreement.pdf, Section 2.1(a)], 
-> $30M in stock [Source: 10_stock_purchase.pdf, Section 1], and 
-> $15M in escrow [Source: 09_escrow_agreement.pdf, Section 2].
+OR to navigate into a subdirectory:
 
-### Citation Rules
-1. **Every factual claim needs a citation** - dates, numbers, names, terms, etc.
-2. **Be specific** - include section numbers, article numbers, or page references when available
-3. **Use the actual filename** - not paraphrased names
-4. **Multiple sources** - if information comes from multiple documents, cite all of them
-
-### Final Answer Structure
-Your final answer should:
-1. **Start with a direct answer** to the user's question
-2. **Provide details** with inline citations
-3. **End with a Sources section** listing all documents consulted:
-
-```
-## Sources Consulted
-- 01_master_agreement.pdf - Main acquisition terms
-- 10_stock_purchase.pdf - Stock component details  
-- 09_escrow_agreement.pdf - Escrow terms and release schedule
-```
-
-## Example Workflow
-
-```
-User asks: "What is the purchase price?"
-
-1. scan_folder("./documents/")
-   Reason: "Scanned 10 documents. Categorizing:
-   - RELEVANT: purchase_agreement.pdf (mentions 'Purchase Price' in preview)
-   - RELEVANT: financial_terms.pdf (contains pricing tables)
-   - MAYBE: exhibits.pdf (referenced by other docs)
-   - SKIP: employee_handbook.pdf, hr_policies.pdf (unrelated to pricing)"
-
-2. parse_file("purchase_agreement.pdf")
-   Reason: "Found purchase price of $50M in Section 2.1. Document references 
-   'Exhibit B for price adjustments' - need to check exhibits.pdf next."
-
-3. parse_file("exhibits.pdf")  [BACKTRACKING]
-   Reason: "Backtracking to exhibits.pdf because purchase_agreement.pdf 
-   referenced it for adjustment details. Found working capital adjustment 
-   formula in Exhibit B."
-
-4. STOP with final answer including citations:
-   "The purchase price is $50,000,000 [Source: purchase_agreement.pdf, Section 2.1], 
-   subject to working capital adjustments [Source: exhibits.pdf, Exhibit B]..."
-```
+{"action": {"directory": "/path/to/dir"}, "reason": "..."}
 """
 
 
@@ -239,84 +159,108 @@ User asks: "What is the purchase price?"
 
 class FsExplorerAgent:
     """
-    AI agent for exploring filesystems using Google Gemini.
-    
+    AI agent for exploring filesystems using Qwen3 via Ollama.
+
     The agent maintains a conversation history with the LLM and uses
     structured JSON output to make decisions about which actions to take.
-    
+
     Attributes:
-        token_usage: Tracks API call statistics and costs.
+        token_usage: Tracks API call statistics.
     """
-    
+
     def __init__(self, api_key: str | None = None) -> None:
         """
-        Initialize the agent with Google API credentials.
-        
+        Initialize the agent with Ollama configuration.
+
         Args:
-            api_key: Google API key. If not provided, reads from
-                     GOOGLE_API_KEY environment variable.
-        
-        Raises:
-            ValueError: If no API key is available.
+            api_key: Not used for Ollama (kept for API compatibility).
+
+        Note:
+            Uses OLLAMA_HOST and MODEL_NAME environment variables,
+            defaulting to http://localhost:11434 and qwen3:32b.
         """
-        if api_key is None:
-            api_key = os.getenv("GOOGLE_API_KEY")
-        if api_key is None:
-            raise ValueError(
-                "GOOGLE_API_KEY not found within the current environment: "
-                "please export it or provide it to the class constructor."
-            )
-        
-        self._client = GenAIClient(
-            api_key=api_key,
-            http_options=HttpOptions(api_version="v1beta"),
+        self._ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        self._model_name = os.getenv("MODEL_NAME", "qwen3:32b")
+        self._num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "65536"))
+
+        # Use native Ollama API via httpx for think=false support.
+        # The OpenAI-compatible endpoint ignores think=false, causing
+        # Qwen3 to spend ~15x longer generating unused thinking tokens.
+        self._client = httpx.AsyncClient(
+            base_url=self._ollama_host,
+            timeout=httpx.Timeout(300.0, connect=10.0),
         )
-        self._chat_history: list[Content] = []
+        self._chat_history: list[dict[str, str]] = []
         self.token_usage = TokenUsage()
 
     def configure_task(self, task: str) -> None:
         """
         Add a task message to the conversation history.
-        
+
         Args:
             task: The task or context to add to the conversation.
         """
-        self._chat_history.append(
-            Content(role="user", parts=[Part.from_text(text=task)])
-        )
+        self._chat_history.append({
+            "role": "user",
+            "content": task
+        })
 
     async def take_action(self) -> tuple[Action, ActionType] | None:
         """
         Request the next action from the AI model.
-        
-        Sends the current conversation history to Gemini and receives
-        a structured JSON response indicating the next action to take.
-        
+
+        Uses Ollama's native /api/chat endpoint with think=false to disable
+        Qwen3's thinking mode, which otherwise adds ~15x latency per call.
+
         Returns:
             A tuple of (Action, ActionType) if successful, None otherwise.
         """
-        response = await self._client.aio.models.generate_content(
-            model="gemini-3-flash-preview",
-            contents=self._chat_history,  # type: ignore
-            config={
-                "system_instruction": SYSTEM_PROMPT,
-                "response_mime_type": "application/json",
-                "response_schema": Action,
+        # Build messages list with system prompt
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *self._chat_history
+        ]
+
+        # Call Ollama's native API with think=false and JSON format
+        response = await self._client.post(
+            "/api/chat",
+            json={
+                "model": self._model_name,
+                "messages": messages,
+                "format": "json",
+                "think": False,
+                "stream": False,
+                "options": {"num_ctx": self._num_ctx},
             },
         )
-        
-        # Track token usage from response metadata
-        if response.usage_metadata:
-            self.token_usage.add_api_call(
-                prompt_tokens=response.usage_metadata.prompt_token_count or 0,
-                completion_tokens=response.usage_metadata.candidates_token_count or 0,
-            )
-        
-        if response.candidates is not None:
-            if response.candidates[0].content is not None:
-                self._chat_history.append(response.candidates[0].content)
-            if response.text is not None:
-                action = Action.model_validate_json(response.text)
+        response.raise_for_status()
+        data = response.json()
+
+        # Track token usage from response
+        prompt_tokens = data.get("prompt_eval_count", 0)
+        completion_tokens = data.get("eval_count", 0)
+        self.token_usage.add_api_call(prompt_tokens, completion_tokens)
+
+        content = data.get("message", {}).get("content", "")
+        if content:
+            # Extract JSON from the response (should already be clean
+            # with think=false, but handle edge cases)
+            json_str = content.strip()
+            if not json_str.startswith("{"):
+                json_start = json_str.find("{")
+                json_end = json_str.rfind("}") + 1
+                if json_start >= 0 and json_end > json_start:
+                    json_str = json_str[json_start:json_end]
+
+            # Store compact JSON in history
+            self._chat_history.append({
+                "role": "assistant",
+                "content": json_str
+            })
+
+            # Parse the JSON response
+            try:
+                action = Action.model_validate_json(json_str)
                 if action.to_action_type() == "toolcall":
                     toolcall = cast(ToolCallAction, action.action)
                     self.call_tool(
@@ -324,13 +268,47 @@ class FsExplorerAgent:
                         tool_input=toolcall.to_fn_args(),
                     )
                 return action, action.to_action_type()
-        
+            except Exception:
+                # Recover from common LLM format mistakes.
+                # E.g. model puts final answer in "reason" with
+                # {"action":{"tool_name":"final_result",...}} instead
+                # of {"action":{"final_result":"..."}}.
+                recovered = self._try_recover_action(json_str)
+                if recovered:
+                    return recovered
+                print(f"Failed to parse response: {json_str[:500]}...")
+
+        return None
+
+    @staticmethod
+    def _try_recover_action(json_str: str) -> tuple[Action, ActionType] | None:
+        """Attempt to recover a valid Action from malformed LLM JSON.
+
+        Common mistake: the model puts the final answer in the "reason"
+        field and sets tool_name to "final_result".
+        """
+        try:
+            raw = json.loads(json_str)
+        except json.JSONDecodeError:
+            return None
+
+        action_data = raw.get("action", {})
+        reason = raw.get("reason", "")
+
+        # Case: {"action": {"tool_name": "final_result", ...}, "reason": "actual answer"}
+        if action_data.get("tool_name") == "final_result" and reason:
+            action = Action(
+                action=StopAction(final_result=reason),
+                reason="Recovered from malformed response",
+            )
+            return action, "stop"
+
         return None
 
     def call_tool(self, tool_name: Tools, tool_input: dict[str, Any]) -> None:
         """
         Execute a tool and add the result to the conversation history.
-        
+
         Args:
             tool_name: Name of the tool to execute.
             tool_input: Dictionary of arguments to pass to the tool.
@@ -342,16 +320,14 @@ class FsExplorerAgent:
                 f"An error occurred while calling tool {tool_name} "
                 f"with {tool_input}: {e}"
             )
-        
+
         # Track tool result sizes
         self.token_usage.add_tool_result(result, tool_name)
-        
-        self._chat_history.append(
-            Content(
-                role="user",
-                parts=[Part.from_text(text=f"Tool result for {tool_name}:\n\n{result}")],
-            )
-        )
+
+        self._chat_history.append({
+            "role": "user",
+            "content": f"Tool result for {tool_name}:\n\n{result}"
+        })
 
     def reset(self) -> None:
         """Reset the agent's conversation history and token tracking."""

@@ -151,12 +151,10 @@ def print_workflow_summary(console: Console, agent, step_count: int) -> None:
     summary.add_row("Completion Tokens:", f"{usage.completion_tokens:,}")
     summary.add_row("Total Tokens:", f"{usage.total_tokens:,}")
     summary.add_row("", "")
-    
-    # Cost calculation
-    input_cost, output_cost, total_cost = usage._calculate_cost()
-    summary.add_row("Est. Input Cost:", f"${input_cost:.4f}")
-    summary.add_row("Est. Output Cost:", f"${output_cost:.4f}")
-    summary.add_row("Est. Total Cost:", f"${total_cost:.4f}")
+
+    # Model info (local inference = free)
+    summary.add_row("Model:", "Qwen3 32B (Local via Ollama)")
+    summary.add_row("Cost:", "$0.00 (Local inference)")
     
     console.print()
     console.print(Panel(
@@ -167,23 +165,26 @@ def print_workflow_summary(console: Console, agent, step_count: int) -> None:
     ))
 
 
-async def run_workflow(task: str) -> None:
+async def run_workflow(task: str, folder: str = ".") -> None:
     """
     Execute the exploration workflow with detailed step-by-step output.
-    
+
     Args:
         task: The user's task/question to answer.
+        folder: The folder to explore (default: current directory).
     """
     console = Console()
-    
-    # Reset agent for fresh state
-    reset_agent()
-    
+
+    # Reset agent state for fresh query (see server.py for detailed explanation)
+    get_agent().reset()
+
     # Print header
     print_workflow_header(console, task)
-    
+
     step_number = 0
-    handler = workflow.run(start_event=InputEvent(task=task))
+    handler = workflow.run(
+        start_event=InputEvent(task=task, folder=folder)
+    )
     
     with console.status(status="[bold cyan]🔄 Analyzing task...") as status:
         async for event in handler.stream_events():
@@ -276,14 +277,22 @@ def main(
         Option(
             "--task",
             "-t",
-            help="Task that the FsExplorer Agent has to perform while exploring the current directory.",
+            help="Task that the FsExplorer Agent has to perform.",
         ),
     ],
+    folder: Annotated[
+        str,
+        Option(
+            "--folder",
+            "-f",
+            help="Folder to explore (default: current directory).",
+        ),
+    ] = ".",
 ) -> None:
     """
     Explore the filesystem to answer questions about documents.
-    
+
     The agent will scan, analyze, and parse relevant documents to provide
     comprehensive answers with source citations.
     """
-    asyncio.run(run_workflow(task))
+    asyncio.run(run_workflow(task, folder))

@@ -9,6 +9,7 @@ import os
 import re
 import glob as glob_module
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from docling.document_converter import DocumentConverter
@@ -117,19 +118,66 @@ def describe_dir_content(directory: str) -> str:
 
 
 # =============================================================================
+# Fuzzy File Path Resolution
+# =============================================================================
+
+def _resolve_file_path(file_path: str) -> str:
+    """
+    Resolve a file path, falling back to fuzzy matching if the exact path
+    doesn't exist. This handles LLMs that hallucinate approximate filenames
+    instead of using exact names from tool results (e.g. "financial_terms.pdf"
+    instead of "11_financial_statements.pdf").
+
+    Args:
+        file_path: The file path provided by the LLM.
+
+    Returns:
+        The original path if it exists, or the closest matching file in the
+        same directory. Returns the original path unchanged if no match is found.
+    """
+    if os.path.exists(file_path):
+        return file_path
+
+    directory = os.path.dirname(file_path) or "."
+    target_name = os.path.basename(file_path).lower()
+
+    if not os.path.isdir(directory):
+        return file_path
+
+    best_match = None
+    best_score = 0.0
+
+    for item in os.listdir(directory):
+        item_path = os.path.join(directory, item)
+        if not os.path.isfile(item_path):
+            continue
+        score = SequenceMatcher(None, target_name, item.lower()).ratio()
+        if score > best_score:
+            best_score = score
+            best_match = item_path
+
+    # Require a reasonable similarity threshold
+    if best_match and best_score >= 0.4:
+        return best_match
+
+    return file_path
+
+
+# =============================================================================
 # Basic File Operations
 # =============================================================================
 
 def read_file(file_path: str) -> str:
     """
     Read the contents of a text file.
-    
+
     Args:
         file_path: Path to the file to read.
-    
+
     Returns:
         The file contents, or an error message if the file doesn't exist.
     """
+    file_path = _resolve_file_path(file_path)
     if not os.path.exists(file_path) or not os.path.isfile(file_path):
         return f"No such file: {file_path}"
     
@@ -140,15 +188,16 @@ def read_file(file_path: str) -> str:
 def grep_file_content(file_path: str, pattern: str) -> str:
     """
     Search for a regex pattern in a file.
-    
+
     Args:
         file_path: Path to the file to search.
         pattern: Regular expression pattern to search for.
-    
+
     Returns:
         A formatted string with matches, "No matches found",
         or an error message if the file doesn't exist.
     """
+    file_path = _resolve_file_path(file_path)
     if not os.path.exists(file_path) or not os.path.isfile(file_path):
         return f"No such file: {file_path}"
     
@@ -194,17 +243,18 @@ def glob_paths(directory: str, pattern: str) -> str:
 def preview_file(file_path: str, max_chars: int = DEFAULT_PREVIEW_CHARS) -> str:
     """
     Get a quick preview of a document file.
-    
+
     Reads only the first portion of the document content for initial
     relevance assessment before doing a full parse.
-    
+
     Args:
         file_path: Path to the document file.
         max_chars: Maximum characters to return (default: 3000, ~2-3 pages).
-    
+
     Returns:
         A preview of the document content, or an error message.
     """
+    file_path = _resolve_file_path(file_path)
     if not os.path.exists(file_path) or not os.path.isfile(file_path):
         return f"No such file: {file_path}"
 
@@ -234,18 +284,19 @@ def preview_file(file_path: str, max_chars: int = DEFAULT_PREVIEW_CHARS) -> str:
 def parse_file(file_path: str) -> str:
     """
     Parse and return the complete content of a document file.
-    
+
     Use this after preview_file() confirms the document is relevant,
     or when you need to find cross-references to other documents.
-    
+
     Supported formats: PDF, DOCX, DOC, PPTX, XLSX, HTML, MD.
-    
+
     Args:
         file_path: Path to the document file.
-    
+
     Returns:
         The complete document content as markdown, or an error message.
     """
+    file_path = _resolve_file_path(file_path)
     if not os.path.exists(file_path) or not os.path.isfile(file_path):
         return f"No such file: {file_path}"
 

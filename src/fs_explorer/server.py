@@ -114,22 +114,24 @@ async def websocket_explore(websocket: WebSocket):
             })
             return
         
-        # Change to target folder
-        original_cwd = os.getcwd()
-        os.chdir(folder_path)
-        
-        # Reset agent for fresh state
-        reset_agent()
-        
+        # Reset agent state (chat history + token usage) for fresh query.
+        # NOTE: We call .reset() on the existing instance rather than
+        # reset_agent() because the workflow's Resource(get_agent) caches
+        # the agent object.
+        get_agent().reset()
+
         # Send start event
         await websocket.send_json({
             "type": "start",
             "data": {"task": task, "folder": str(folder_path)}
         })
-        
-        # Run the workflow
+
+        # Run the workflow — pass the absolute folder path so the
+        # workflow uses it directly instead of depending on os.chdir().
         step_number = 0
-        handler = workflow.run(start_event=InputEvent(task=task))
+        handler = workflow.run(
+            start_event=InputEvent(task=task, folder=str(folder_path))
+        )
         
         async for event in handler.stream_events():
             if isinstance(event, ToolCallEvent):
@@ -179,8 +181,7 @@ async def websocket_explore(websocket: WebSocket):
         # Get token usage
         agent = get_agent()
         usage = agent.token_usage
-        input_cost, output_cost, total_cost = usage._calculate_cost()
-        
+
         await websocket.send_json({
             "type": "complete",
             "data": {
@@ -195,7 +196,8 @@ async def websocket_explore(websocket: WebSocket):
                     "completion_tokens": usage.completion_tokens,
                     "total_tokens": usage.total_tokens,
                     "tool_result_chars": usage.tool_result_chars,
-                    "estimated_cost": round(total_cost, 6),
+                    "estimated_cost": 0.0,  # Local model = free
+                    "model": f"{agent._model_name} (Local via Ollama)",
                 }
             }
         })
@@ -208,12 +210,10 @@ async def websocket_explore(websocket: WebSocket):
             "data": {"message": str(e)}
         })
     finally:
-        # Restore original working directory
-        if 'original_cwd' in locals():
-            os.chdir(original_cwd)
+        pass
 
 
-def run_server(host: str = "127.0.0.1", port: int = 8000):
+def run_server(host: str = "0.0.0.0", port: int = 8000):
     """Run the FastAPI server."""
     import uvicorn
     uvicorn.run(app, host=host, port=port)
