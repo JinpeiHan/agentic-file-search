@@ -20,7 +20,10 @@ _env_path = Path(__file__).parent.parent.parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
 
-from .models import Action, ActionType, StopAction, ToolCallAction, Tools
+from .models import (
+    Action, ActionType, AskHumanAction, GoDeeperAction,
+    StopAction, ToolCallAction, ToolCallArg, Tools,
+)
 from .fs import (
     read_file,
     grep_file_content,
@@ -258,52 +261,116 @@ class FsExplorerAgent:
                 "content": json_str
             })
 
-            # Parse the JSON response
+            # Parse the JSON response — first try strict Pydantic,
+            # then fall back to flexible manual parsing.
             try:
-                action = Action.model_validate_json(json_str)
-                if action.to_action_type() == "toolcall":
-                    toolcall = cast(ToolCallAction, action.action)
-                    self.call_tool(
-                        tool_name=toolcall.tool_name,
-                        tool_input=toolcall.to_fn_args(),
-                    )
-                return action, action.to_action_type()
-            except Exception:
-                # Recover from common LLM format mistakes.
-                # E.g. model puts final answer in "reason" with
-                # {"action":{"tool_name":"final_result",...}} instead
-                # of {"action":{"final_result":"..."}}.
-                recovered = self._try_recover_action(json_str)
-                if recovered:
-                    return recovered
-                print(f"Failed to parse response: {json_str[:500]}...")
+                action, action_type = self._parse_action(json_str)
+            except ValueError as e:
+                print(f"Failed to parse response: {e}")
+                return None
+
+            if action_type == "toolcall":
+                toolcall = cast(ToolCallAction, action.action)
+                self.call_tool(
+                    tool_name=toolcall.tool_name,
+                    tool_input=toolcall.to_fn_args(),
+                )
+            return action, action_type
 
         return None
 
     @staticmethod
-    def _try_recover_action(json_str: str) -> tuple[Action, ActionType] | None:
-        """Attempt to recover a valid Action from malformed LLM JSON.
+    def _parse_action(json_str: str) -> tuple[Action, ActionType]:
+        """Parse an action from JSON, with flexible recovery.
 
-        Common mistake: the model puts the final answer in the "reason"
-        field and sets tool_name to "final_result".
+        Tries strict Pydantic parsing first.  When that fails (common
+        with local models), falls back to manual extraction that
+        handles every observed malformed pattern:
+
+        1. tool_name="final_result" with answer in reason
+        2. tool_input as [{"param": "val"}] instead of
+           [{"parameter_name": "param", "parameter_value": "val"}]
+        3. tool_input as {"param": "val"} dict instead of list
+        4. final_result at the action level but mixed with other keys
         """
+        # Fast path: strict Pydantic parsing
+        try:
+            action = Action.model_validate_json(json_str)
+            return action, action.to_action_type()
+        except Exception:
+            pass
+
+        # Slow path: manual recovery
         try:
             raw = json.loads(json_str)
         except json.JSONDecodeError:
-            return None
+            raise ValueError(f"Invalid JSON: {json_str[:200]}")
 
         action_data = raw.get("action", {})
         reason = raw.get("reason", "")
 
-        # Case: {"action": {"tool_name": "final_result", ...}, "reason": "actual answer"}
-        if action_data.get("tool_name") == "final_result" and reason:
-            action = Action(
-                action=StopAction(final_result=reason),
-                reason="Recovered from malformed response",
-            )
-            return action, "stop"
+        # --- Stop / final_result ---
+        # Case 1: {"action": {"final_result": "..."}}
+        if "final_result" in action_data:
+            return Action(
+                action=StopAction(final_result=action_data["final_result"]),
+                reason=reason,
+            ), "stop"
 
-        return None
+        # Case 2: {"action": {"tool_name": "final_result", ...}, "reason": "actual answer"}
+        if action_data.get("tool_name") == "final_result":
+            answer = reason or str(action_data.get("tool_input", ""))
+            return Action(
+                action=StopAction(final_result=answer),
+                reason="Recovered: tool_name was final_result",
+            ), "stop"
+
+        # --- Directory navigation ---
+        if "directory" in action_data and "tool_name" not in action_data:
+            return Action(
+                action=GoDeeperAction(directory=action_data["directory"]),
+                reason=reason,
+            ), "godeeper"
+
+        # --- Question ---
+        if "question" in action_data:
+            return Action(
+                action=AskHumanAction(question=action_data["question"]),
+                reason=reason,
+            ), "askhuman"
+
+        # --- Tool calls with malformed tool_input ---
+        tool_name = action_data.get("tool_name")
+        tool_input_raw = action_data.get("tool_input", [])
+
+        if tool_name and tool_name in (
+            "read", "grep", "glob", "scan_folder", "preview_file", "parse_file"
+        ):
+            args: list[ToolCallArg] = []
+
+            if isinstance(tool_input_raw, dict):
+                # {"tool_input": {"file_path": "/foo"}}
+                for k, v in tool_input_raw.items():
+                    args.append(ToolCallArg(parameter_name=k, parameter_value=v))
+            elif isinstance(tool_input_raw, list):
+                for item in tool_input_raw:
+                    if "parameter_name" in item and "parameter_value" in item:
+                        # Correct format
+                        args.append(ToolCallArg(
+                            parameter_name=item["parameter_name"],
+                            parameter_value=item["parameter_value"],
+                        ))
+                    elif isinstance(item, dict):
+                        # {"file_path": "/foo"} or {"directory": "/bar"}
+                        for k, v in item.items():
+                            args.append(ToolCallArg(parameter_name=k, parameter_value=v))
+
+            return Action(
+                action=ToolCallAction(tool_name=tool_name, tool_input=args),  # type: ignore[arg-type]
+                reason=reason,
+            ), "toolcall"
+
+        raise ValueError(f"Unrecognized action format: {json_str[:300]}")
 
     def call_tool(self, tool_name: Tools, tool_input: dict[str, Any]) -> None:
         """
