@@ -24,61 +24,87 @@ This video explains the architecture of the project and how to run it.
 
 - 🔍 **6 Tools**: `scan_folder`, `preview_file`, `parse_file`, `read`, `grep`, `glob`
 - 📄 **Document Support**: PDF, DOCX, PPTX, XLSX, HTML, Markdown (via Docling)
-- 🤖 **Powered by**: Google Gemini 3 Flash with structured JSON output
-- 💰 **Cost Efficient**: ~$0.001 per query with token tracking
+- 🤖 **Powered by**: Qwen3 32B running locally via Ollama (no cloud, no API keys)
+- 💰 **100% Free**: Local inference on your own hardware
 - 🌐 **Web UI**: Real-time WebSocket streaming interface
 - 📊 **Citations**: Answers include source references
+- ⚡ **Optimized**: Native Ollama API with thinking tokens disabled for 15x faster responses
 
-## Installation
+## Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/PromtEngineer/agentic-file-search.git
+# Clone this branch
+git clone -b feat/ollama-qwen3-native-api https://github.com/PromtEngineer/agentic-file-search.git
 cd agentic-file-search
 
-# Install with uv (recommended)
-uv pip install .
+# Install dependencies (requires uv: https://docs.astral.sh/uv/)
+uv sync
 
-# Or with pip
-pip install .
+# Set up environment
+cp .env.example .env
 ```
 
-## Configuration
+### Prerequisites
 
-Create a `.env` file in the project root:
+1. **Install Ollama**: https://ollama.com/download
+2. **Pull the model**:
+```bash
+ollama pull qwen3:32b
+```
+3. **Verify Ollama is running**:
+```bash
+curl http://localhost:11434/api/tags
+```
+
+### Configuration
+
+Edit `.env` in the project root:
 
 ```bash
-GOOGLE_API_KEY=your_api_key_here
+OLLAMA_HOST=http://localhost:11434
+MODEL_NAME=qwen3:32b
+# OLLAMA_NUM_CTX=65536      # Context window (default: 65536)
+# WORKFLOW_TIMEOUT=600       # Max query time in seconds (default: 600)
 ```
-
-Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
 
 ## Usage
-
-### CLI
-
-```bash
-# Basic query
-uv run explore --task "What is the purchase price in data/test_acquisition/?"
-
-# Multi-document query
-uv run explore --task "Look in data/large_acquisition/. What are all the financial terms including adjustments and escrow?"
-```
 
 ### Web UI
 
 ```bash
 # Start the server
-uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
+uv run explore-ui
 
-# Open http://127.0.0.1:8000 in your browser
+# Open http://localhost:8000 in your browser
 ```
 
 The web UI provides:
 - Folder browser to select target directory
 - Real-time step-by-step execution log
 - Final answer with citations
-- Token usage and cost statistics
+- Token usage statistics
+
+### CLI
+
+```bash
+# Basic query
+uv run explore --task "What is the purchase price?" --folder ./data/test_acquisition
+
+# Multi-document query
+uv run explore --task "What are all the financial terms including adjustments and escrow?" --folder ./data/large_acquisition
+```
+
+### Concurrent Benchmark
+
+Measure your hardware's performance with parallel queries:
+
+```bash
+# Run 6 queries at concurrency levels 1, 2, 4, 8
+uv run python -u benchmarks/concurrent_benchmark.py --concurrency 1,2,4,8 --warmup
+
+# Quick test with 3 queries
+uv run python -u benchmarks/concurrent_benchmark.py -c 1,4 -n 3
+```
 
 ## Architecture
 
@@ -90,7 +116,7 @@ User Query
 └────────┬────────┘
          ↓
 ┌─────────────────┐
-│     Agent       │ ←→ Gemini 3 Flash (structured JSON)
+│     Agent       │ ←→ Qwen3 32B via Ollama (structured JSON)
 └────────┬────────┘
          ↓
 ┌─────────────────────────────────────────┐
@@ -125,7 +151,7 @@ uv run explore --task "Look in data/large_acquisition/. What happens to employee
 
 | Component | Technology |
 |-----------|------------|
-| LLM | Google Gemini 3 Flash |
+| LLM | Qwen3 32B via Ollama (local) |
 | Document Parsing | Docling (local, open-source) |
 | Orchestration | LlamaIndex Workflows |
 | CLI | Typer + Rich |
@@ -136,7 +162,7 @@ uv run explore --task "Look in data/large_acquisition/. What happens to employee
 
 ```
 src/fs_explorer/
-├── agent.py      # Gemini client, token tracking
+├── agent.py      # Ollama client, token tracking
 ├── workflow.py   # LlamaIndex workflow engine
 ├── fs.py         # File tools: scan, parse, grep
 ├── models.py     # Pydantic models for actions
@@ -149,13 +175,17 @@ src/fs_explorer/
 
 ```bash
 # Install dev dependencies
-uv pip install -e ".[dev]"
+uv sync --group dev
 
 # Run tests
-uv run pytest
+make test
 
-# Lint
-uv run ruff check .
+# Lint + format
+make lint
+make format
+
+# Type check
+make typecheck
 ```
 
 ## License
@@ -166,7 +196,7 @@ MIT
 
 - Original concept from [run-llama/fs-explorer](https://github.com/run-llama/fs-explorer)
 - Document parsing by [Docling](https://github.com/DS4SD/docling)
-- Powered by [Google Gemini](https://deepmind.google/technologies/gemini/)
+- Local inference by [Ollama](https://ollama.com/) + [Qwen3](https://github.com/QwenLM/Qwen3)
 
 ## Star History
 
