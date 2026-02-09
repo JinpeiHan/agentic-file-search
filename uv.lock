@@ -484,6 +484,7 @@ source = { editable = "." }
 dependencies = [
     { name = "docling" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "llama-index-workflows" },
     { name = "openai" },
     { name = "python-dotenv" },
@@ -507,6 +508,7 @@ dev = [
 requires-dist = [
     { name = "docling", specifier = ">=2.55.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "llama-index-workflows", specifier = ">=2.11.5" },
     { name = "openai", specifier = ">=1.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
